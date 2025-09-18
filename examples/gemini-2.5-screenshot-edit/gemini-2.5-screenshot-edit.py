@@ -8,6 +8,7 @@ from io import BytesIO
 from PIL import Image
 import questionary
 from datetime import datetime
+from editing_presets import get_preset_choices, get_preset_prompt, build_system_prompt
 
 load_dotenv()
 
@@ -65,18 +66,13 @@ def scrape_website_screenshot(url: str):
 
 
 def edit_screenshot(
-    image: Image.Image, prompt: str, version: int, filename_suffix: str = ""
+    image: Image.Image, system_prompt: str, version: int, filename_suffix: str = ""
 ):
-    """Edit the screenshot using Gemini 2.5 Flash"""
+    """Edit the screenshot using Gemini 2.5 Flash with system prompt"""
     try:
-        full_prompt = f"""
-        You will be given a screenshot of a website and a user provided prompt. You need to edit the website screenshot to help address the user's prompt.
-        The user's prompt is: {prompt}.
-        """
-
         print("Editing screenshot...")
         response = client.models.generate_content(
-            model="gemini-2.5-flash-image-preview", contents=[full_prompt, image]
+            model="gemini-2.5-flash-image-preview", contents=[system_prompt, image]
         )
 
         if response.candidates[0].content.parts is None:
@@ -137,85 +133,178 @@ def main():
             reference_stack = [current_image]  # v1 will be produced from this reference
 
             while True:
-                prompt = input("Enter a prompt to edit the screenshot: ").strip()
-                if not prompt:
-                    continue
+                if version == 0:  # First edit - show preset styles
+                    print("Choose an editing style for your screenshot:")
+                    preset_choices = get_preset_choices()
+                    selected_preset = questionary.select(
+                        "Select an editing style:", choices=preset_choices
+                    ).ask()
 
-                version += 1
-                reference_image = reference_stack[-1]  # last reference used
-                edited_image = edit_screenshot(reference_image, prompt, version)
-                if not edited_image:
-                    print("Failed to edit screenshot.")
-                    again = input("Try a different prompt? (y/n): ").strip().lower()
-                    if again == "y":
-                        version -= 1  # don't consume a version number on failure
-                        continue
-                    else:
+                    if selected_preset is None:
                         break
 
-                current_image = edited_image
-                # For "edit further", the new reference becomes the current result
-                reference_stack.append(current_image)
+                    if selected_preset == "custom":
+                        custom_prompt = input(
+                            "\nEnter your custom editing prompt: "
+                        ).strip()
+                        if not custom_prompt:
+                            continue
+                        system_prompt = build_system_prompt(custom_prompt)
+                        edit_description = "Custom Style"
+                    else:
+                        preset_prompt = get_preset_prompt(selected_preset)
+                        system_prompt = build_system_prompt(preset_prompt)
+                        edit_description = preset_choices[
+                            next(
+                                i
+                                for i, choice in enumerate(preset_choices)
+                                if choice["value"] == selected_preset
+                            )
+                        ]["name"].split(" - ")[0]
 
-                # Choice loop - shows choices after each edit/redo
-                while True:
+                    version += 1
+                    reference_image = reference_stack[-1]  # last reference used
+                    print(f"\nApplying {edit_description} style...")
+                    edited_image = edit_screenshot(
+                        reference_image, system_prompt, version
+                    )
+                    if not edited_image:
+                        print("Failed to edit screenshot.")
+                        again = input("Try a different style? (y/n): ").strip().lower()
+                        if again == "y":
+                            version -= 1  # don't consume a version number on failure
+                            continue
+                        else:
+                            break
+
+                    current_image = edited_image
+                    # For "edit further", the new reference becomes the current result
+                    reference_stack.append(current_image)
+
+                else:  # Subsequent edits - show different menu
                     choices = [
-                        "Edit the screenshot further",
-                        "Redo last edit with a new prompt",
+                        "Edit the screenshot further (custom prompt only)",
+                        "Redo last edit with same reference",
+                        "Redo with another style (back to original)",
                         "Start over with a new URL",
                         "Exit",
                     ]
                     choice = questionary.select(
                         "What would you like to do next?", choices=choices
                     ).ask()
-                    if not choice:
-                        print("No selection. Exiting.")
-                        return
 
-                    if choice == "Edit the screenshot further":
-                        # Break out of choice loop to ask for new prompt
+                    if choice is None:
                         break
 
-                    elif choice == "Redo last edit with a new prompt":
-                        # Pop the last reference because redo should use the SAME reference as the current version
+                    if choice == "Edit the screenshot further (custom prompt only)":
+                        custom_prompt = input(
+                            "\nEnter your custom editing prompt: "
+                        ).strip()
+                        if not custom_prompt:
+                            continue
+                        system_prompt = build_system_prompt(custom_prompt)
+                        edit_description = "Custom Style"
+
+                        version += 1
+                        reference_image = reference_stack[-1]  # last reference used
+                        print(f"\nApplying {edit_description}...")
+                        edited_image = edit_screenshot(
+                            reference_image, system_prompt, version
+                        )
+                        if not edited_image:
+                            print("Failed to edit screenshot.")
+                            continue
+
+                        current_image = edited_image
+                        reference_stack.append(current_image)
+
+                    elif choice == "Redo last edit with same reference":
+                        # Use the same reference as the current version
                         if len(reference_stack) >= 2:
-                            redo_reference = reference_stack[
-                                -2
-                            ]  # the reference used for current version
+                            redo_reference = reference_stack[-2]
                         else:
                             redo_reference = reference_stack[-1]
 
-                        redo_prompt = input(
-                            "Enter a new prompt to redo the last edit: "
+                        redo_custom_prompt = input(
+                            "\nEnter your custom editing prompt for redo: "
                         ).strip()
-                        if not redo_prompt:
-                            continue  # Stay in choice loop
+                        if not redo_custom_prompt:
+                            continue
+                        redo_system_prompt = build_system_prompt(redo_custom_prompt)
+                        redo_description = "Custom Style"
 
+                        print(f"\nRe-applying {redo_description}...")
                         redo_image = edit_screenshot(
                             redo_reference,
-                            redo_prompt,
+                            redo_system_prompt,
                             version,
                             filename_suffix="-redo",
                         )
                         if not redo_image:
                             print("Failed to generate redo image.")
                         else:
-                            print(
-                                "Redo image generated (current image remains unchanged)."
+                            print("Redo image generated.")
+
+                    elif choice == "Redo with another style (back to original)":
+                        print("\n" + "=" * 50)
+                        print("Choose a style to apply to the original screenshot:")
+                        print("=" * 50)
+
+                        redo_preset_choices = get_preset_choices()
+                        redo_selected_preset = questionary.select(
+                            "Select an editing style:",
+                            choices=redo_preset_choices,
+                        ).ask()
+
+                        if redo_selected_preset is None:
+                            continue
+
+                        if redo_selected_preset == "custom":
+                            redo_custom_prompt = input(
+                                "\nEnter your custom editing prompt: "
+                            ).strip()
+                            if not redo_custom_prompt:
+                                continue
+                            redo_system_prompt = build_system_prompt(redo_custom_prompt)
+                            redo_description = "Custom Style"
+                        else:
+                            redo_preset_prompt = get_preset_prompt(redo_selected_preset)
+                            redo_system_prompt = build_system_prompt(redo_preset_prompt)
+                            redo_description = redo_preset_choices[
+                                next(
+                                    i
+                                    for i, choice in enumerate(redo_preset_choices)
+                                    if choice["value"] == redo_selected_preset
+                                )
+                            ]["name"].split(" - ")[0]
+
+                        # Use the original screenshot (first in reference stack)
+                        original_reference = reference_stack[0]
+                        print(
+                            f"\nApplying {redo_description} to original screenshot..."
+                        )
+                        redo_image = edit_screenshot(
+                            original_reference,
+                            redo_system_prompt,
+                            1,  # Reset to version 1 since we're starting over from original
+                            filename_suffix="-original-redo",
+                        )
+                        if not redo_image:
+                            print("Failed to generate redo image.")
+                        else:
+                            print("Redo from original generated.")
+                            # Reset the stack to just original + new result, and start fresh
+                            current_image = redo_image
+                            reference_stack = [reference_stack[0], redo_image]
+                            version = (
+                                1  # Reset version since we're essentially starting over
                             )
-                        # Stay at same version; do not alter stack or current_image
-                        # Continue in choice loop to show choices again
-                        continue
 
                     elif choice == "Start over with a new URL":
-                        break  # break choice loop -> break editing loop -> ask for url again
+                        break  # break editing loop -> ask for url again
 
                     elif choice == "Exit":
                         return
-
-                # If we broke out of the choice loop, check if it was "Start over"
-                if choice == "Start over with a new URL":
-                    break  # break editing loop -> ask for url again
 
     except KeyboardInterrupt:
         print("\nExiting...")
